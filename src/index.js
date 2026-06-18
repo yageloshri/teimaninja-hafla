@@ -1,0 +1,497 @@
+// Teimaninja Hafla server — real-time 1v1, shared-seed authority.
+//
+// STATELESS + Redis: matchmaking queue and cross-instance relay live in Redis
+// so Render can run >=1 warm instance and scale out. The instance that pairs a
+// match owns its round timer and the authoritative ruling.
+//
+// This is the foundation the multiplayer-agent + playtest-bot harden. The
+// shared-seed determinism it depends on is proven client-side in
+// test/playtest/hafla_determinism_test.dart.
+
+import http from 'node:http';
+import crypto from 'node:crypto';
+import { WebSocketServer } from 'ws';
+import Redis from 'ioredis';
+
+import {
+  PORT,
+  REDIS_URL,
+  ORIGIN_ALLOWLIST,
+  STRICT_ORIGIN,
+  ROUND_SECONDS,
+  COUNTDOWN_SECONDS,
+  RECONNECT_GRACE_MS,
+  BOT_FALLBACK_MS,
+  MMR_BUCKET,
+} from './config.js';
+import { C2S, S2C, encode, decode } from './protocol.js';
+import { spawnBot } from './bot.js';
+
+// ---- Redis (shared state + pub/sub relay) --------------------------------
+const redis = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 3 });
+const sub = new Redis(REDIS_URL, { lazyConnect: true });
+let redisReady = false;
+redis.on('ready', () => { redisReady = true; });
+redis.on('error', () => { redisReady = false; });
+
+// Local connections this instance owns: playerId → ws.
+const sockets = new Map();
+// Matches this instance is finalizing: matchId → match record.
+const localMatches = new Map();
+
+const QUEUE_KEY = (bucket) => `hafla:q:${bucket}`;
+
+// ---- HTTP (health) -------------------------------------------------------
+const server = http.createServer(async (req, res) => {
+  if (req.url === '/health' || req.url === '/healthz') {
+    let ok = redisReady;
+    try { ok = (await redis.ping()) === 'PONG'; } catch { ok = false; }
+    res.writeHead(ok ? 200 : 503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ status: ok ? 'ok' : 'degraded', redis: ok }));
+    return;
+  }
+  res.writeHead(404);
+  res.end();
+});
+
+// ---- WebSocket -----------------------------------------------------------
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const origin = req.headers.origin;
+  if (!originAllowed(origin)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+});
+
+function originAllowed(origin) {
+  if (!origin) return !STRICT_ORIGIN; // native apps send no Origin
+  return ORIGIN_ALLOWLIST.includes(origin);
+}
+
+wss.on('connection', (ws) => {
+  ws.isAlive = true;
+  ws.player = null;
+  ws.matchId = null;
+  ws.on('pong', () => { ws.isAlive = true; });
+  ws.on('message', (raw) => handleMessage(ws, raw));
+  ws.on('close', () => handleClose(ws));
+});
+
+async function handleMessage(ws, raw) {
+  const msg = decode(raw.toString());
+  if (!msg) return;
+  const { type, data } = msg;
+
+  switch (type) {
+    case C2S.HEARTBEAT:
+      ws.isAlive = true;
+      break;
+
+    case C2S.QUICK_QUEUE: {
+      registerPlayer(ws, data);
+      await tryMatchOrQueue(ws, data);
+      break;
+    }
+
+    case C2S.CREATE_ROOM: {
+      registerPlayer(ws, data);
+      const code = roomCode();
+      await redis.set(`hafla:room:${code}`, JSON.stringify({
+        host: ws.player, mmr: data.mmr ?? 0,
+      }), 'EX', 600);
+      ws.roomCode = code;
+      send(ws, S2C.ROOM_CREATED, { code });
+      break;
+    }
+
+    case C2S.JOIN_ROOM: {
+      registerPlayer(ws, data);
+      const rawRoom = await redis.get(`hafla:room:${data.code}`);
+      if (!rawRoom) { send(ws, S2C.ERROR, { message: 'room_not_found' }); break; }
+      await redis.del(`hafla:room:${data.code}`);
+      const host = JSON.parse(rawRoom);
+      // The joiner's instance owns finalization (it has both? no — host may be
+      // on another instance). Relay handles cross-instance; finalize-authority
+      // is whichever instance calls startMatch. For room joins, the joiner.
+      //
+      // BUG FIX (playtest-bot): startMatch treats a/b as player ID STRINGS
+      // everywhere (sockets.get(a), match.players[a], publishMatch(..,a,..)).
+      // host.host is the full player OBJECT {id,name,mmr} that CREATE_ROOM
+      // stored, and ws.player is also the full object — passing the objects
+      // meant sockets.get({...}) was always undefined, so neither room player
+      // ever received match_found and recordScore keyed by id never matched.
+      // Pass the IDs, matching the quick_queue path which already uses
+      // oppId / ws.player.id.
+      startMatch({ a: host.host.id, b: ws.player.id, isBot: false });
+      break;
+    }
+
+    case C2S.SCORE_TICK:
+      relayToOpponent(ws, S2C.OPPONENT_TICK, {
+        score: data.score | 0, combo: data.combo | 0, lives: data.lives | 0,
+      });
+      recordScore(ws, data.score | 0);
+      break;
+
+    case C2S.FINISH:
+      recordScore(ws, data.score | 0, true);
+      break;
+
+    case C2S.REJOIN: {
+      registerPlayer(ws, data);
+      await rejoinMatch(ws, data.matchId);
+      break;
+    }
+
+    case C2S.CANCEL:
+      await leaveQueue(ws);
+      break;
+  }
+}
+
+// Bug D: a client that dropped mid-match reconnects within the grace window and
+// asks to resume. Re-bind the socket to the match, re-subscribe the relay
+// channel, cancel the pending abandon (handled implicitly — the abandon timer
+// re-checks sockets.get(id).matchId), and replay the current opponent state so
+// the returning client's opponent bar is correct again. The shared seed means
+// the player's own local sim kept running, so resuming is a no-op on gameplay.
+async function rejoinMatch(ws, matchId) {
+  const match = matchId ? localMatches.get(matchId) : null;
+  if (!match || match.settled || !match.players[ws.player.id]) {
+    // Nothing to resume (wrong instance, already settled, or unknown match).
+    send(ws, S2C.ERROR, { message: 'rejoin_failed' });
+    return;
+  }
+  ws.matchId = matchId;
+  if (ws.botTimer) clearTimeout(ws.botTimer);
+  // Re-subscribe this instance to the relay (it may have unsubscribed nothing,
+  // but a fresh subscribe is idempotent and covers a cross-instance return).
+  sub.subscribe(`hafla:relay:${matchId}`).catch(() => {});
+  // Clear the leaver mark so a late abandon timer sees the player is back.
+  delete match.players[ws.player.id].leftAt;
+
+  // Replay the opponent's current numbers so the resumed bar is accurate.
+  const oppId = ws.player.id === match.a ? match.b : match.a;
+  const opp = match.isBot
+    ? { score: match.botScore ?? 0, combo: 0, lives: 0 }
+    : { score: match.players[oppId]?.score ?? 0, combo: 0, lives: 0 };
+  send(ws, S2C.REJOINED, { matchId, opponent: opp });
+  // Let a human opponent know the reconnect succeeded (clear the "weak" hint).
+  if (!match.isBot && oppId != null) {
+    publishMatch(matchId, oppId, S2C.OPPONENT_TICK, {
+      score: match.players[ws.player.id].score, combo: 0, lives: 0,
+    });
+  }
+}
+
+function registerPlayer(ws, data) {
+  ws.player = { id: data.playerId, name: data.name ?? '', mmr: data.mmr ?? 0 };
+  sockets.set(ws.player.id, ws);
+}
+
+// ---- Matchmaking ---------------------------------------------------------
+async function tryMatchOrQueue(ws, data) {
+  const bucket = Math.floor((data.mmr ?? 0) / MMR_BUCKET);
+  // Try the player's bucket and the two adjacent ones for a waiting opponent.
+  for (const b of [bucket, bucket - 1, bucket + 1]) {
+    const oppId = await redis.lpop(QUEUE_KEY(b));
+    if (oppId && oppId !== ws.player.id) {
+      startMatch({ a: oppId, b: ws.player.id, isBot: false });
+      return;
+    }
+  }
+  await redis.rpush(QUEUE_KEY(bucket), ws.player.id);
+  await redis.expire(QUEUE_KEY(bucket), 60);
+  ws.queuedBucket = bucket;
+  send(ws, S2C.QUEUED, {});
+
+  // Bot fallback: if still queued after BOT_FALLBACK_MS, give them a bot.
+  ws.botTimer = setTimeout(async () => {
+    const removed = await redis.lrem(QUEUE_KEY(bucket), 1, ws.player.id);
+    if (removed > 0 && ws.readyState === ws.OPEN) {
+      startMatch({ a: ws.player.id, b: null, isBot: true });
+    }
+  }, BOT_FALLBACK_MS);
+}
+
+async function leaveQueue(ws) {
+  if (ws.botTimer) clearTimeout(ws.botTimer);
+  if (ws.queuedBucket != null && ws.player) {
+    await redis.lrem(QUEUE_KEY(ws.queuedBucket), 1, ws.player.id);
+  }
+}
+
+// ---- Match lifecycle -----------------------------------------------------
+function startMatch({ a, b, isBot }) {
+  const matchId = crypto.randomUUID();
+  // Shared seed: a 31-bit positive int (fits Dart's Random(seed) cleanly).
+  const seed = crypto.randomInt(1, 0x7fffffff);
+  const match = {
+    matchId, seed, isBot,
+    players: { [a]: { score: 0, finished: false, weak: false } },
+    a, b,
+    bot: null,
+    startMs: null,
+    settled: false,
+  };
+  if (!isBot) match.players[b] = { score: 0, finished: false, weak: false };
+  localMatches.set(matchId, match);
+
+  // Subscribe this instance to the match relay channel (cross-instance ticks).
+  sub.subscribe(`hafla:relay:${matchId}`).catch(() => {});
+
+  const wsA = sockets.get(a);
+  if (wsA) { wsA.matchId = matchId; if (wsA.botTimer) clearTimeout(wsA.botTimer); }
+  const wsB = b ? sockets.get(b) : null;
+  if (wsB) { wsB.matchId = matchId; if (wsB.botTimer) clearTimeout(wsB.botTimer); }
+
+  const oppFor = (id) => {
+    const otherId = id === a ? b : a;
+    return isBot && otherId == null
+      ? { name: 'סבא יגל', isBot: true }
+      : { name: (sockets.get(otherId)?.player?.name) ?? '', isBot: false };
+  };
+
+  publishMatch(matchId, a, S2C.MATCH_FOUND, {
+    matchId, seed, mode: 'classic', roundSeconds: ROUND_SECONDS,
+    opponent: oppFor(a), isBot,
+  });
+  if (!isBot) {
+    publishMatch(matchId, b, S2C.MATCH_FOUND, {
+      matchId, seed, mode: 'classic', roundSeconds: ROUND_SECONDS,
+      opponent: oppFor(b), isBot: false,
+    });
+  }
+
+  runCountdown(match);
+}
+
+function runCountdown(match) {
+  let n = COUNTDOWN_SECONDS;
+  const tick = () => {
+    if (match.settled) return;
+    if (n > 0) {
+      broadcast(match, S2C.COUNTDOWN, { n });
+      n--;
+      setTimeout(tick, 1000);
+    } else {
+      match.startMs = Date.now();
+      broadcast(match, S2C.GO, { serverStartMs: match.startMs });
+      if (match.isBot) startBot(match);
+      // Authoritative round deadline (+ small grace for the last tick).
+      match.deadline = setTimeout(() => settle(match, 'timeout'),
+        ROUND_SECONDS * 1000 + 1500);
+    }
+  };
+  tick();
+}
+
+function startBot(match) {
+  const humanMmr = sockets.get(match.a)?.player?.mmr ?? 0;
+  match.bot = spawnBot({
+    matchId: match.matchId, seed: match.seed, humanMmr,
+    onTick: (t) => publishMatch(match.matchId, match.a, S2C.OPPONENT_TICK, t),
+    onFinish: ({ score }) => {
+      match.botScore = score;
+      maybeSettle(match);
+    },
+  });
+}
+
+function recordScore(ws, score, finished = false) {
+  const match = localMatches.get(ws.matchId);
+  if (!match || match.settled) return;
+  const p = match.players[ws.player.id];
+  if (!p) return;
+  p.score = Math.max(p.score, score);
+  if (finished && !p.finished) {
+    p.finished = true;
+    // Bug C: stamp the authoritative server-side finish time so a simultaneous
+    // (equal-score) finish is broken by whoever the server saw finish FIRST.
+    p.finishedAt = Date.now();
+  }
+  maybeSettle(match);
+}
+
+function maybeSettle(match) {
+  if (match.settled) return;
+  if (match.isBot) {
+    const human = match.players[match.a];
+    if (human.finished && match.botScore != null) settle(match, 'finish');
+    return;
+  }
+  const allFinished = Object.values(match.players).every((p) => p.finished);
+  if (allFinished) settle(match, 'finish');
+}
+
+// Authoritative ruling. Server timestamp breaks simultaneous finishes.
+function settle(match, reason) {
+  if (match.settled) return;
+  match.settled = true;
+  if (match.deadline) clearTimeout(match.deadline);
+  if (match.bot) match.bot.stop();
+
+  const aScore = match.players[match.a].score;
+  const bScore = match.isBot ? (match.botScore ?? 0) : match.players[match.b].score;
+
+  // Bug C: on EXACTLY equal scores the server timestamp breaks the tie — the
+  // player the server saw finish FIRST wins. We only fall back to a genuine
+  // 'tie' when neither side has a finish timestamp (e.g. a timeout settle where
+  // nobody sent FINISH). `winnerSeat` is 'a' | 'b' | null (null = real tie).
+  const aFin = match.players[match.a].finishedAt;
+  const bFin = match.isBot ? null : match.players[match.b].finishedAt;
+  let winnerSeat;
+  if (aScore > bScore) {
+    winnerSeat = 'a';
+  } else if (aScore < bScore) {
+    winnerSeat = 'b';
+  } else if (aFin != null && (bFin == null || aFin < bFin)) {
+    winnerSeat = 'a'; // a finished first (or only a finished)
+  } else if (bFin != null && (aFin == null || bFin < aFin)) {
+    winnerSeat = 'b'; // b finished first (or only b finished)
+  } else {
+    winnerSeat = null; // neither finished (timeout) → legitimate tie
+  }
+
+  const outcomeForSeat = (seat) =>
+    winnerSeat == null ? 'tie' : winnerSeat === seat ? 'won' : 'lost';
+
+  publishMatch(match.matchId, match.a, S2C.RESULT, {
+    outcome: outcomeForSeat('a'), myScore: aScore, oppScore: bScore, reason,
+  });
+  if (!match.isBot) {
+    publishMatch(match.matchId, match.b, S2C.RESULT, {
+      outcome: outcomeForSeat('b'), myScore: bScore, oppScore: aScore, reason,
+    });
+  }
+
+  // TODO(firebase-agent handoff): POST result to the Firestore-writing path
+  // (hafla_won / hafla_lost / hafla_abandoned). Kept out of the hot path.
+  persistResult(match, { aScore, bScore, reason }).catch(() => {});
+
+  sub.unsubscribe(`hafla:relay:${match.matchId}`).catch(() => {});
+  localMatches.delete(match.matchId);
+}
+
+async function persistResult(match, payload) {
+  // Placeholder: push onto a Redis stream the result-worker drains and writes
+  // to Firestore with the analytics events. Keeps this web service Spark-clean
+  // and off the request hot path. See handoffs/hafla-design.md.
+  if (!redisReady) return;
+  await redis.xadd('hafla:results', '*',
+    'matchId', match.matchId,
+    'a', match.a, 'b', String(match.b ?? 'bot'),
+    'aScore', String(payload.aScore), 'bScore', String(payload.bScore),
+    'reason', payload.reason);
+}
+
+// ---- Relay (cross-instance via Redis pub/sub) ----------------------------
+function relayToOpponent(ws, type, data) {
+  const match = localMatches.get(ws.matchId);
+  if (!match) {
+    // Opponent's instance owns the match; publish to the relay channel.
+    if (ws.matchId) {
+      redis.publish(`hafla:relay:${ws.matchId}`,
+        JSON.stringify({ from: ws.player.id, type, data }));
+    }
+    return;
+  }
+  const oppId = ws.player.id === match.a ? match.b : match.a;
+  publishMatch(match.matchId, oppId, type, data);
+}
+
+// Deliver to a player whether they're local or on another instance.
+function publishMatch(matchId, playerId, type, data) {
+  if (playerId == null) return;
+  const local = sockets.get(playerId);
+  if (local && local.readyState === local.OPEN) {
+    send(local, type, data);
+  } else {
+    redis.publish(`hafla:relay:${matchId}`,
+      JSON.stringify({ to: playerId, type, data }));
+  }
+}
+
+sub.on('message', (_chan, raw) => {
+  try {
+    const m = JSON.parse(raw);
+    if (m.to) {
+      const ws = sockets.get(m.to);
+      if (ws && ws.readyState === ws.OPEN) send(ws, m.type, m.data);
+    }
+  } catch { /* ignore */ }
+});
+
+// ---- Disconnect / reconnect ----------------------------------------------
+function handleClose(ws) {
+  if (!ws.player) return;
+  leaveQueue(ws);
+  sockets.delete(ws.player.id);
+
+  const match = localMatches.get(ws.matchId);
+  if (!match || match.settled) return;
+  const leaverId = ws.player.id;
+  const leaverSeat = leaverId === match.a ? 'a' : 'b';
+  // Only a human opponent is notified. In a bot match there is no opponent
+  // socket (oppId is null) — OPPONENT_LEFT/RESULT to null are no-ops, so skip
+  // the phantom notify entirely (Bug E).
+  const oppId = match.isBot ? null : (leaverSeat === 'a' ? match.b : match.a);
+  if (oppId != null) {
+    // Tell the opponent a reconnect window is open; abandon = their win.
+    publishMatch(match.matchId, oppId, S2C.OPPONENT_LEFT, { grace: true });
+  }
+  match.players[leaverId].leftAt = Date.now();
+  setTimeout(() => {
+    if (match.settled) return;
+    const back = sockets.get(leaverId);
+    if (back && back.matchId === match.matchId) return; // rejoined in time
+    // Abandon. The leaver simply loses; no phantom opponent in a bot match.
+    match.players[leaverId].score = -1; // ensure loss
+    if (match.isBot) {
+      // The human abandoned a bot match: resolve cleanly, the human lost.
+      match.botScore = Math.max(match.botScore ?? 0, 0);
+    }
+    // reason: abandon_<seat that abandoned>.
+    settle(match, leaverSeat === 'a' ? 'abandon_a' : 'abandon_b');
+  }, RECONNECT_GRACE_MS);
+}
+
+// ---- Helpers -------------------------------------------------------------
+function send(ws, type, data) {
+  if (ws.readyState === ws.OPEN) ws.send(encode(type, data));
+}
+function broadcast(match, type, data) {
+  publishMatch(match.matchId, match.a, type, data);
+  if (!match.isBot) publishMatch(match.matchId, match.b, type, data);
+}
+function roomCode() {
+  // 5 unambiguous chars (no O/0/I/1) — easy to read aloud / type.
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let s = '';
+  for (let i = 0; i < 5; i++) s += alphabet[crypto.randomInt(alphabet.length)];
+  return s;
+}
+
+// Drop dead sockets (mobile backgrounding = disconnect, spec §4).
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) { ws.terminate(); continue; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch { /* ignore */ }
+  }
+}, 15_000);
+
+// ---- Boot ----------------------------------------------------------------
+async function boot() {
+  await redis.connect().catch(() => {});
+  await sub.connect().catch(() => {});
+  server.listen(PORT, () => {
+    // eslint-disable-next-line no-console
+    console.log(`[hafla] listening on :${PORT}  redis=${REDIS_URL.replace(/:[^:@/]*@/, ':***@')}`);
+  });
+}
+boot();

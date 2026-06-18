@@ -1,0 +1,19 @@
+{
+  "name": "teimaninja-hafla-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Real-time 1v1 (חפלה / Hafla) game server for Teimaninja — stateless, Redis-backed, shared-seed authority.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1",
+    "ws": "^8.18.0"
+  }
+}

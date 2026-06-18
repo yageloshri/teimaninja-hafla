@@ -1,0 +1,30 @@
+# Render blueprint for the Hafla 1v1 server.
+# NOTE: some settings the render MCP cannot toggle must be set by hand in the
+# Render Dashboard — see handoffs/hafla-design.md → "Render manual checklist"
+# (Professional plan auto-scaling, min 1 always-warm instance / no
+# scale-to-zero, and the Key Value/Redis instance).
+services:
+  - type: web
+    name: teimaninja-hafla
+    runtime: node
+    plan: starter            # ⬆ change to "professional" in the dashboard for auto-scaling
+    region: frankfurt        # closest low-latency region for IL players
+    rootDir: .               # this repo IS the server (server/ pushed as repo root)
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    numInstances: 1          # min 1 always-warm; raise the floor in the dashboard
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: REDIS_URL
+        sync: false          # set from the Key Value connection string (dashboard)
+      - key: ORIGIN_ALLOWLIST
+        value: https://teman-ninja.com,https://www.teman-ninja.com
+      - key: STRICT_ORIGIN
+        value: "false"       # native app sends no Origin
+      - key: ROUND_SECONDS
+        value: "75"
+      - key: SERVER_SHARED_SECRET
+        sync: false
