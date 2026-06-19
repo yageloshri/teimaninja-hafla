@@ -3,32 +3,34 @@
 // final pacing is tuned against playtest-bot's real profiles
 // (handoffs/hafla-design.md → playtest-bot coordination).
 //
-// The server does NOT run the Flame game for the bot. It emits a believable
-// score TIMELINE: a slightly noisy ramp toward a target final score chosen
-// near the human's MMR, with realistic combo bursts and the occasional stall.
+// The server does NOT run the Flame game for the bot. It emits a HUMAN-LIKE
+// score timeline whose rate tracks the game's own fruit-spawn ramp (slow start,
+// accelerating) with combo spikes, plus a skill-based elimination time — so the
+// opening isn't a free win and the bot's progress reads naturally, not flat.
 
 import { SCORE_TICK_MS } from './config.js';
 
 const PROFILES = {
-  // Points/second bands + variance, CALIBRATED against the real Flutter
-  // BotProfile medians for a 75s Classic round, neutral loadout (measured in
-  // test/playtest/hafla_fairness_test.dart → [ordering]):
-  //     beginner median ≈ 83,  average ≈ 133,  pro ≈ 173.
-  // Calibration (server/test/bot.test.js → CALIBRATION, and calib sweep) lands
-  // this bot's final-score medians on those numbers within ±3%:
-  //     beginner → ~84,  average → ~132,  pro → ~175  (over 400 sims/profile).
-  // NOTE the relationship is NON-LINEAR at this scale: base = pps*0.25 is <1 so
-  // Math.round() zeroes most ticks and the few non-zero/combo ticks dominate —
-  // hence pps≈1.6–2.2, NOT the tens-of-points placeholders that were here
-  // before (which produced ~1600/2825/4480, ~19× too high). Re-run the
-  // CALIBRATION test if the real medians or ROUND_SECONDS change.
-  // survivalMin/Max (seconds): how long until the bot is ELIMINATED — this IS
-  // the bot's skill in the elimination duel (the survivor wins). A weaker bot
-  // dies sooner; a pro outlasts most players.
-  beginner: { pps: 1.6, jitter: 0.6, comboChance: 0.10, survivalMin: 16, survivalMax: 45 },
-  average: { pps: 1.92, jitter: 0.5, comboChance: 0.16, survivalMin: 36, survivalMax: 85 },
-  pro: { pps: 2.18, jitter: 0.45, comboChance: 0.24, survivalMin: 70, survivalMax: 150 },
+  // HUMAN-LIKE pacing. `skill` = the fraction of the fruit actually on screen
+  // that the bot slices — its score therefore tracks the GAME's own spawn ramp
+  // (slow start, accelerating), not a flat rate from t=0. `survivalMin/Max` (s)
+  // = when the bot is eliminated; both bounds start AFTER the trivial early
+  // phase (no bombs for the first 10s, ~1 fruit/2.9s) so the bot never dies
+  // unrealistically early and the opening isn't a free win. All rise with skill.
+  beginner: { skill: 0.50, comboChance: 0.10, survivalMin: 24, survivalMax: 70 },
+  average: { skill: 0.68, comboChance: 0.16, survivalMin: 50, survivalMax: 120 },
+  pro: { skill: 0.85, comboChance: 0.24, survivalMin: 90, survivalMax: 200 },
 };
+
+// Fruit per SECOND the game spawns at elapsed time t — mirrors SpawnDirector:
+// waves of waveItemsMin→Max (1→5) over waveItemsRampTime (140s), wave interval
+// decaying waveIntervalStart→Floor (2.9→1.05s) with tau 60. A human's score
+// rate ≈ this × their accuracy, so the bot uses the same curve.
+function gameFruitPerSec(t) {
+  const items = 1 + 4 * Math.min(1, t / 140);
+  const interval = 1.05 + 1.85 * Math.exp(-t / 60);
+  return items / interval;
+}
 
 function pickProfile(humanMmr) {
   // Match the human roughly so games are close (fun), not stomps.
@@ -63,36 +65,39 @@ export function spawnBot({ matchId, seed, humanMmr, onTick, onEliminated }) {
     (profile.survivalMin +
       rand() * (profile.survivalMax - profile.survivalMin)) * 1000);
 
-  let score = 0;
+  const dt = SCORE_TICK_MS / 1000;
+  let score = 0; // accumulated as a float; reported rounded
   let combo = 0;
   let elapsed = 0;
   let done = false;
 
   const interval = setInterval(() => {
     elapsed += SCORE_TICK_MS;
-    // Base earn this tick + jitter; occasional stall (human distraction).
-    const stall = rand() < 0.06;
-    const base = stall ? 0 : (profile.pps * SCORE_TICK_MS) / 1000;
-    const noise = 1 + (rand() * 2 - 1) * profile.jitter;
-    let gain = Math.max(0, Math.round(base * noise));
-
-    // Combo bursts.
-    if (!stall && rand() < profile.comboChance) {
+    const t = elapsed / 1000;
+    // Foods sliced this tick = skill × what's actually on screen now (ramps with
+    // the game), with mild steadiness noise — no flat rate, no unrealistic
+    // early scoring.
+    let gain = profile.skill * gameFruitPerSec(t) * dt *
+        (1 + (rand() * 2 - 1) * 0.18);
+    // Combo bursts — the human-like spikes; they only start once the board has
+    // enough fruit to chain (a few seconds in), and build a multiplier.
+    const comboReady = Math.min(1, t / 18);
+    if (rand() < profile.comboChance * comboReady) {
       combo = Math.min(8, combo + 1);
-      gain += Math.round(gain * combo * 0.25);
+      gain += gain * (0.8 + combo * 0.25);
     } else {
       combo = 0;
     }
-    score += gain;
+    score += Math.max(0, gain);
 
     // Lives tick down toward elimination so the opponent bar shows it fading.
     const lives = Math.max(0, Math.ceil(3 * (1 - elapsed / survivalMs)));
-    onTick({ score, combo, lives });
+    onTick({ score: Math.round(score), combo, lives });
 
     if (elapsed >= survivalMs && !done) {
       done = true;
       clearInterval(interval);
-      onEliminated({ score });
+      onEliminated({ score: Math.round(score) });
     }
   }, SCORE_TICK_MS);
 
