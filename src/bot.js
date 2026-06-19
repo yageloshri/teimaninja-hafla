@@ -7,7 +7,7 @@
 // score TIMELINE: a slightly noisy ramp toward a target final score chosen
 // near the human's MMR, with realistic combo bursts and the occasional stall.
 
-import { ROUND_SECONDS, SCORE_TICK_MS } from './config.js';
+import { SCORE_TICK_MS } from './config.js';
 
 const PROFILES = {
   // Points/second bands + variance, CALIBRATED against the real Flutter
@@ -22,9 +22,12 @@ const PROFILES = {
   // hence pps≈1.6–2.2, NOT the tens-of-points placeholders that were here
   // before (which produced ~1600/2825/4480, ~19× too high). Re-run the
   // CALIBRATION test if the real medians or ROUND_SECONDS change.
-  beginner: { pps: 1.6, jitter: 0.6, comboChance: 0.10 },
-  average: { pps: 1.92, jitter: 0.5, comboChance: 0.16 },
-  pro: { pps: 2.18, jitter: 0.45, comboChance: 0.24 },
+  // survivalMin/Max (seconds): how long until the bot is ELIMINATED — this IS
+  // the bot's skill in the elimination duel (the survivor wins). A weaker bot
+  // dies sooner; a pro outlasts most players.
+  beginner: { pps: 1.6, jitter: 0.6, comboChance: 0.10, survivalMin: 16, survivalMax: 45 },
+  average: { pps: 1.92, jitter: 0.5, comboChance: 0.16, survivalMin: 36, survivalMax: 85 },
+  pro: { pps: 2.18, jitter: 0.45, comboChance: 0.24, survivalMin: 70, survivalMax: 150 },
 };
 
 function pickProfile(humanMmr) {
@@ -47,21 +50,26 @@ function rng(seed) {
   };
 }
 
-/// Returns a callback-driven bot. `onTick({score,combo,lives})` fires every
-/// SCORE_TICK_MS; `onFinish({score})` at round end. Caller owns the timers'
-/// lifecycle via the returned `stop()`.
-export function spawnBot({ matchId, seed, humanMmr, onTick, onFinish }) {
+/// Returns a callback-driven bot for the ELIMINATION duel. `onTick` fires every
+/// SCORE_TICK_MS with the bot's live numbers (for the opponent bar);
+/// `onEliminated({score})` fires once when the bot's skill-based survival time
+/// is up (→ the human wins, unless already settled). `stop()` cancels it.
+export function spawnBot({ matchId, seed, humanMmr, onTick, onEliminated }) {
   const profile = PROFILES[pickProfile(humanMmr)];
   const rand = rng((seed ^ hashCode(matchId)) | 0);
-  const ticks = Math.floor((ROUND_SECONDS * 1000) / SCORE_TICK_MS);
+  // The bot's survival time = when it gets eliminated. (ROUND_SECONDS is no
+  // longer a round length — there's no fixed round in the elimination model.)
+  const survivalMs = Math.round(
+    (profile.survivalMin +
+      rand() * (profile.survivalMax - profile.survivalMin)) * 1000);
 
   let score = 0;
   let combo = 0;
-  let lives = 3;
-  let i = 0;
+  let elapsed = 0;
+  let done = false;
 
   const interval = setInterval(() => {
-    i++;
+    elapsed += SCORE_TICK_MS;
     // Base earn this tick + jitter; occasional stall (human distraction).
     const stall = rand() < 0.06;
     const base = stall ? 0 : (profile.pps * SCORE_TICK_MS) / 1000;
@@ -77,15 +85,18 @@ export function spawnBot({ matchId, seed, humanMmr, onTick, onFinish }) {
     }
     score += gain;
 
+    // Lives tick down toward elimination so the opponent bar shows it fading.
+    const lives = Math.max(0, Math.ceil(3 * (1 - elapsed / survivalMs)));
     onTick({ score, combo, lives });
 
-    if (i >= ticks) {
+    if (elapsed >= survivalMs && !done) {
+      done = true;
       clearInterval(interval);
-      onFinish({ score });
+      onEliminated({ score });
     }
   }, SCORE_TICK_MS);
 
-  return { stop: () => clearInterval(interval), isBot: true };
+  return { stop: () => clearInterval(interval), isBot: true, survivalMs };
 }
 
 function hashCode(str) {

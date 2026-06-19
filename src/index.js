@@ -51,6 +51,12 @@ const BOT_NAMES = [
 ];
 const pickBotName = (seed) => BOT_NAMES[Math.abs(seed) % BOT_NAMES.length];
 
+// ELIMINATION duel: the match runs until ONE player is eliminated (out of
+// lives / bomb) — there is NO fixed round. This long safety cap only guards
+// against a zombie match where nobody is ever eliminated; it's ruled by score
+// as a last resort.
+const MAX_MATCH_MS = 5 * 60 * 1000;
+
 // ---- HTTP (health) -------------------------------------------------------
 const server = http.createServer(async (req, res) => {
   if (req.url === '/health' || req.url === '/healthz') {
@@ -292,9 +298,18 @@ function runCountdown(match) {
       match.startMs = Date.now();
       broadcast(match, S2C.GO, { serverStartMs: match.startMs });
       if (match.isBot) startBot(match);
-      // Authoritative round deadline (+ small grace for the last tick).
-      match.deadline = setTimeout(() => settle(match, 'timeout'),
-        ROUND_SECONDS * 1000 + 1500);
+      // Safety cap only (no fixed round): if nobody is ever eliminated, rule
+      // by score as a last resort.
+      match.deadline = setTimeout(() => {
+        const a = match.players[match.a].score;
+        const b = match.isBot
+          ? (match.botScore ?? 0)
+          : match.players[match.b].score;
+        settle(match, {
+          reason: 'timeout',
+          loserSeat: a < b ? 'a' : b < a ? 'b' : null,
+        });
+      }, MAX_MATCH_MS);
     }
   };
   tick();
@@ -304,10 +319,16 @@ function startBot(match) {
   const humanMmr = sockets.get(match.a)?.player?.mmr ?? 0;
   match.bot = spawnBot({
     matchId: match.matchId, seed: match.seed, humanMmr,
-    onTick: (t) => publishMatch(match.matchId, match.a, S2C.OPPONENT_TICK, t),
-    onFinish: ({ score }) => {
+    // Keep the latest bot score for the opponent bar + the result display.
+    onTick: (t) => {
+      match.botScore = t.score;
+      publishMatch(match.matchId, match.a, S2C.OPPONENT_TICK, t);
+    },
+    // The bot is ELIMINATED at its skill-based survival time → the human wins
+    // (unless the human was already eliminated first — settle guards that).
+    onEliminated: ({ score }) => {
       match.botScore = score;
-      maybeSettle(match);
+      settle(match, { reason: 'eliminated', loserSeat: 'b' });
     },
   });
 }
@@ -320,26 +341,19 @@ function recordScore(ws, score, finished = false) {
   p.score = Math.max(p.score, score);
   if (finished && !p.finished) {
     p.finished = true;
-    // Bug C: stamp the authoritative server-side finish time so a simultaneous
-    // (equal-score) finish is broken by whoever the server saw finish FIRST.
     p.finishedAt = Date.now();
+    // ELIMINATION: the FIRST player to be eliminated (their local run ended —
+    // out of lives / bomb) LOSES; the survivor wins. settle() guards order, so
+    // if the bot (or the other human) was eliminated first this is a no-op.
+    const seat = ws.player.id === match.a ? 'a' : 'b';
+    settle(match, { reason: 'eliminated', loserSeat: seat });
   }
-  maybeSettle(match);
 }
 
-function maybeSettle(match) {
-  if (match.settled) return;
-  if (match.isBot) {
-    const human = match.players[match.a];
-    if (human.finished && match.botScore != null) settle(match, 'finish');
-    return;
-  }
-  const allFinished = Object.values(match.players).every((p) => p.finished);
-  if (allFinished) settle(match, 'finish');
-}
-
-// Authoritative ruling. Server timestamp breaks simultaneous finishes.
-function settle(match, reason) {
+// Authoritative ruling — ELIMINATION: `loserSeat` is the player eliminated
+// FIRST (or who abandoned). They lose; the other wins. `loserSeat` is null only
+// on the rare safety-timeout with equal scores → a genuine tie.
+function settle(match, { reason, loserSeat }) {
   if (match.settled) return;
   match.settled = true;
   if (match.deadline) clearTimeout(match.deadline);
@@ -348,27 +362,8 @@ function settle(match, reason) {
   const aScore = match.players[match.a].score;
   const bScore = match.isBot ? (match.botScore ?? 0) : match.players[match.b].score;
 
-  // Bug C: on EXACTLY equal scores the server timestamp breaks the tie — the
-  // player the server saw finish FIRST wins. We only fall back to a genuine
-  // 'tie' when neither side has a finish timestamp (e.g. a timeout settle where
-  // nobody sent FINISH). `winnerSeat` is 'a' | 'b' | null (null = real tie).
-  const aFin = match.players[match.a].finishedAt;
-  const bFin = match.isBot ? null : match.players[match.b].finishedAt;
-  let winnerSeat;
-  if (aScore > bScore) {
-    winnerSeat = 'a';
-  } else if (aScore < bScore) {
-    winnerSeat = 'b';
-  } else if (aFin != null && (bFin == null || aFin < bFin)) {
-    winnerSeat = 'a'; // a finished first (or only a finished)
-  } else if (bFin != null && (aFin == null || bFin < aFin)) {
-    winnerSeat = 'b'; // b finished first (or only b finished)
-  } else {
-    winnerSeat = null; // neither finished (timeout) → legitimate tie
-  }
-
   const outcomeForSeat = (seat) =>
-    winnerSeat == null ? 'tie' : winnerSeat === seat ? 'won' : 'lost';
+    loserSeat == null ? 'tie' : loserSeat === seat ? 'lost' : 'won';
 
   publishMatch(match.matchId, match.a, S2C.RESULT, {
     outcome: outcomeForSeat('a'), myScore: aScore, oppScore: bScore, reason,
@@ -465,8 +460,8 @@ function handleClose(ws) {
       // The human abandoned a bot match: resolve cleanly, the human lost.
       match.botScore = Math.max(match.botScore ?? 0, 0);
     }
-    // reason: abandon_<seat that abandoned>.
-    settle(match, leaverSeat === 'a' ? 'abandon_a' : 'abandon_b');
+    // The leaver is the loser; the opponent wins.
+    settle(match, { reason: 'abandon', loserSeat: leaverSeat });
   }, RECONNECT_GRACE_MS);
 }
 
