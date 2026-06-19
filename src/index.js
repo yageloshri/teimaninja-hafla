@@ -41,6 +41,16 @@ const localMatches = new Map();
 
 const QUEUE_KEY = (bucket) => `hafla:q:${bucket}`;
 
+// Believable opponent names for the fallback bot — the player must NOT be able
+// to tell it's a bot, so it never carries a "bot/מתאמן" tell. Picked
+// deterministically per match (by seed) so it's stable across the VS/bar/result.
+const BOT_NAMES = [
+  'רוני', 'אבישי', 'ליאור', 'עידן', 'נועם', 'איתי', 'דניאל', 'יואב',
+  'אורי', 'תומר', 'שגב', 'מתן', 'אלון', 'גיא', 'הראל', 'עומר',
+  'אסף', 'ניר', 'יותם', 'רותם',
+];
+const pickBotName = (seed) => BOT_NAMES[Math.abs(seed) % BOT_NAMES.length];
+
 // ---- HTTP (health) -------------------------------------------------------
 const server = http.createServer(async (req, res) => {
   if (req.url === '/health' || req.url === '/healthz') {
@@ -252,7 +262,7 @@ function startMatch({ a, b, isBot }) {
   const oppFor = (id) => {
     const otherId = id === a ? b : a;
     return isBot && otherId == null
-      ? { name: 'סבא יגל', isBot: true }
+      ? { name: pickBotName(seed), isBot: true }
       : { name: (sockets.get(otherId)?.player?.name) ?? '', isBot: false };
   };
 
