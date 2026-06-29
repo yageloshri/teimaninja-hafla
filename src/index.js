@@ -34,6 +34,19 @@ let redisReady = false;
 redis.on('ready', () => { redisReady = true; });
 redis.on('error', () => { redisReady = false; });
 
+// ---- Observability -------------------------------------------------------
+// Structured one-line logs at the key match-lifecycle points so match volume,
+// started→settled completion, abandon rate, and bot-vs-real share are readable
+// straight from Render logs (today they live only in GA4 — the server kept no
+// queryable record). Anonymized anon-Firebase uids only; NEVER log PII.
+// Additive: pure observation, no effect on matchmaking/gameplay/determinism.
+function obs(fields) {
+  try {
+    // eslint-disable-next-line no-console
+    console.log(JSON.stringify({ ...fields, ts: Date.now() }));
+  } catch { /* logging must never throw into the hot path */ }
+}
+
 // Local connections this instance owns: playerId → ws.
 const sockets = new Map();
 // Matches this instance is finalizing: matchId → match record.
@@ -224,6 +237,7 @@ async function tryMatchOrQueue(ws, data) {
   await redis.expire(QUEUE_KEY(bucket), 60);
   ws.queuedBucket = bucket;
   send(ws, S2C.QUEUED, {});
+  obs({ evt: 'queue', uid: ws.player.id, mmr: data.mmr ?? 0 });
 
   // Bot fallback: if still queued after BOT_FALLBACK_MS, give them a bot.
   ws.botTimer = setTimeout(async () => {
@@ -256,6 +270,16 @@ function startMatch({ a, b, isBot }) {
   };
   if (!isBot) match.players[b] = { score: 0, finished: false, weak: false };
   localMatches.set(matchId, match);
+
+  // Observability: a match was made. isBot = the opponent is a bot-fallback.
+  // mmrBucket = the coarse MMR band the pairing came from (same arithmetic as
+  // tryMatchOrQueue) — anonymized uids only, NO PII.
+  const aMmr = sockets.get(a)?.player?.mmr ?? 0;
+  obs({
+    evt: 'match_found', matchId, p1: a, p2: isBot ? 'bot' : b, isBot,
+    mmrBucket: Math.floor(aMmr / MMR_BUCKET),
+  });
+  bumpMatchesCounter();
 
   // Subscribe this instance to the match relay channel (cross-instance ticks).
   sub.subscribe(`hafla:relay:${matchId}`).catch(() => {});
@@ -374,24 +398,80 @@ function settle(match, { reason, loserSeat }) {
     });
   }
 
+  // Observability: a match settled. Map the internal reason to the reported
+  // taxonomy (normal/abandon/cap), and resolve winner/loser uids from the
+  // eliminated seat. `null` loserSeat = a genuine tie on the safety timeout.
+  const obsReason =
+    reason === 'abandon' ? 'abandon' : reason === 'timeout' ? 'cap' : 'normal';
+  const seatUid = (seat) =>
+    seat === 'a' ? match.a : (match.isBot ? 'bot' : match.b);
+  const winner = loserSeat == null ? null
+    : seatUid(loserSeat === 'a' ? 'b' : 'a');
+  const loser = loserSeat == null ? null : seatUid(loserSeat);
+  const durationMs = match.startMs ? Date.now() - match.startMs : 0;
+  obs({
+    evt: 'settle', matchId: match.matchId, winner, loser,
+    isBot: match.isBot, durationMs, reason: obsReason,
+  });
+
   // TODO(firebase-agent handoff): POST result to the Firestore-writing path
   // (hafla_won / hafla_lost / hafla_abandoned). Kept out of the hot path.
-  persistResult(match, { aScore, bScore, reason }).catch(() => {});
+  persistResult(match, { aScore, bScore, reason: obsReason }).catch(() => {});
 
   sub.unsubscribe(`hafla:relay:${match.matchId}`).catch(() => {});
   localMatches.delete(match.matchId);
 }
 
 async function persistResult(match, payload) {
-  // Placeholder: push onto a Redis stream the result-worker drains and writes
-  // to Firestore with the analytics events. Keeps this web service Spark-clean
-  // and off the request hot path. See handoffs/hafla-design.md.
+  // Off the request hot path, fire-and-forget (settle()'s .catch swallows any
+  // error), and gated on redisReady so it NEVER affects gameplay if Redis is
+  // flaky. Two things happen here, both additive observability:
+  //
+  //  1) XADD onto hafla:results — the durable per-match stream a future
+  //     result-worker can drain to Firestore (kept for that handoff).
+  //  2) In-process daily counters in Redis so match volume / completion /
+  //     abandon / bot-share are queryable WITHOUT a separate worker or a
+  //     Firestore rules deploy. We chose the in-process INCRs (not a standalone
+  //     worker) because they add zero new process, zero deps, and run inside
+  //     this already-running settle path — the lowest-risk thing that makes the
+  //     data queryable. Query later with e.g. `MGET hafla:stats:2026-06-29:*`
+  //     or GET the individual keys.
   if (!redisReady) return;
   await redis.xadd('hafla:results', '*',
     'matchId', match.matchId,
     'a', match.a, 'b', String(match.b ?? 'bot'),
     'aScore', String(payload.aScore), 'bScore', String(payload.bScore),
     'reason', payload.reason);
+
+  // Daily aggregate counters (UTC day). `matches` is incremented at match_found
+  // time; here we count the SETTLED side so started→settled completion is
+  // readable as settled/matches. A pipeline keeps it to one round-trip.
+  const day = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+  const base = `hafla:stats:${day}`;
+  const ttl = 90 * 24 * 60 * 60; // keep ~90 days, then self-expire
+  const pipe = redis.pipeline();
+  pipe.incr(`${base}:settled`);
+  pipe.expire(`${base}:settled`, ttl);
+  if (payload.reason === 'abandon') {
+    pipe.incr(`${base}:abandoned`);
+    pipe.expire(`${base}:abandoned`, ttl);
+  }
+  if (match.isBot) {
+    pipe.incr(`${base}:bot`);
+    pipe.expire(`${base}:bot`, ttl);
+  }
+  await pipe.exec();
+}
+
+// Bump the daily `matches` counter when a match is MADE (not when it settles),
+// so started→settled completion = settled/matches is meaningful. Fire-and-
+// forget, redisReady-gated — never on the gameplay path.
+function bumpMatchesCounter() {
+  if (!redisReady) return;
+  const day = new Date().toISOString().slice(0, 10);
+  const key = `hafla:stats:${day}:matches`;
+  const ttl = 90 * 24 * 60 * 60;
+  redis.pipeline().incr(key).expire(key, ttl).exec().catch(() => {});
 }
 
 // ---- Relay (cross-instance via Redis pub/sub) ----------------------------
